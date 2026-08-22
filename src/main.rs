@@ -3,8 +3,8 @@ use actix_web::http::{header, StatusCode};
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
 use serde_json::Value;
 
-// hop-by-hop + content-length: body 被 patch 后长度变化, 长度头必须让框架按实际 body 重算
-const SKIP_HEADERS: [&str; 5] = ["connection", "keep-alive", "transfer-encoding", "upgrade", "content-length"];
+// hop-by-hop + content-length + host: body 被 patch 后长度变化需重算; host 是客户端地址, 上游按 Host 路由, 必须让 reqwest 按上游 URL 重设
+const SKIP_HEADERS: [&str; 6] = ["connection", "keep-alive", "transfer-encoding", "upgrade", "content-length", "host"];
 const HOP_BY_HOP: [&str; 4] = ["connection", "keep-alive", "transfer-encoding", "upgrade"];
 
 #[derive(Clone)]
@@ -186,6 +186,7 @@ async fn main() -> std::io::Result<()> {
     let app = HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(server_cfg.clone()))
+            .app_data(web::PayloadConfig::new(16 << 20)) // ponytail: 长对话 JSON 常超默认 256KB; 16MB 足够, 再大按需调
             .service(web::resource("/{path:.*}").route(web::to(proxy)))
     })
     .bind(("127.0.0.1", cfg.port))?;
