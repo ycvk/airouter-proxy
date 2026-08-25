@@ -1,10 +1,13 @@
 {
   "port": 8080,
-  "upstream": "https://api.airouter.ch",
+  "upstream": "https://lenca.agentthread.ai",
   "api_key": "sk-...",
   "patch": {
     "temperature": 0.7,
     "top_p": 0.9,
     "max_tokens": 8192
+  },
+  "rename": {
+    "max_tokens": "max_completion_tokens"
   }
 }
