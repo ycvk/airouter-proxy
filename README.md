@@ -1,5 +1,7 @@
 # airouter-proxy
 
+[![Release](https://github.com/ycvk/airouter-proxy/actions/workflows/release.yml/badge.svg)](https://github.com/ycvk/airouter-proxy/releases/latest)
+
 一个小型 HTTP 反向代理，用于在请求转发到上游 API 前改写顶层 JSON 字段，并流式返回上游响应。
 
 ## 功能
@@ -11,7 +13,19 @@
 - 过滤逐跳 HTTP headers，流式转发 SSE/chunked 响应。
 - 单个请求体最大 16 MiB。
 
-## 快速开始
+## 下载
+
+从 [Latest Release](https://github.com/ycvk/airouter-proxy/releases/latest) 下载对应平台的预编译包：
+
+| 平台 | 文件 |
+| --- | --- |
+| Linux x86_64 | `airouter-proxy-linux-x86_64.tar.gz` |
+| macOS Apple Silicon | `airouter-proxy-macos-arm64.tar.gz` |
+| Windows x86_64 | `airouter-proxy-windows-x86_64.zip` |
+
+解压后，在二进制同目录创建 `config.json`，配置格式参见 [`config.example.json`](config.example.json)，然后直接运行 `airouter-proxy`（Windows 为 `airouter-proxy.exe`）。
+
+## 从源码运行
 
 需要 Rust stable toolchain。
 
