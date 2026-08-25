@@ -1,6 +1,6 @@
 {
   "port": 8080,
-  "upstream": "https://lenca.agentthread.ai",
+  "upstream": "https://xxx.example.ai",
   "api_key": "sk-...",
   "patch": {
     "temperature": 0.7,
