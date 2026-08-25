@@ -1,11 +1,22 @@
 use actix_web::body::BodyStream;
 use actix_web::http::{header, StatusCode};
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+use serde::Deserialize;
 use serde_json::Value;
 
-// hop-by-hop + content-length + host: body 被 patch 后长度变化需重算; host 是客户端地址, 上游按 Host 路由, 必须让 reqwest 按上游 URL 重设
-const SKIP_HEADERS: [&str; 7] = ["connection", "keep-alive", "transfer-encoding", "upgrade", "content-length", "host", "accept-encoding"]; // accept-encoding: 上游压缩会让 reqwest 解压后头体错配, 一律明文
-const HOP_BY_HOP: [&str; 4] = ["connection", "keep-alive", "transfer-encoding", "upgrade"];
+// RFC 9110 §7.6.1 固定逐跳头；Connection 还可动态指定其他逐跳头。
+const HOP_BY_HOP: [&str; 8] = [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+// reqwest 必须按改写后的 body 和上游 URL 重建这些头。
+const REQUEST_REBUILT: [&str; 2] = ["content-length", "host"];
 // 上游可能按 UA 区分浏览器/客户端流量, 用真实 Chrome UA 而非 reqwest 默认
 const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 
@@ -20,58 +31,106 @@ struct Cfg {
     client: reqwest::Client,
 }
 
+#[derive(Default, Deserialize)]
+struct FileCfg {
+    port: Option<u16>,
+    upstream: Option<String>,
+    #[serde(default)]
+    patch: Value,
+    #[serde(default)]
+    rename: Value,
+    api_key: Option<String>,
+}
+
 /// 配置: cwd 下的 config.json, 环境变量 PORT/UPSTREAM/API_KEY 可覆盖。
-fn load_cfg() -> Cfg {
-    let mut port: u16 = 8080;
-    let mut upstream = "https://lenca.agentthread.ai".to_string();
-    let mut patch: Value = Value::Null;
-    let mut rename: Value = Value::Null;
-    let mut api_key: Option<String> = None;
-    let debug = std::env::args().any(|a| a == "--debug");
+fn load_cfg() -> Result<Cfg, String> {
+    let file_cfg = match std::fs::read_to_string("config.json") {
+        Ok(s) => parse_file_cfg(&s)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileCfg::default(),
+        Err(e) => return Err(format!("cannot read config.json: {e}")),
+    };
+    let mut port = file_cfg.port.unwrap_or(8080);
+    let mut upstream = file_cfg.upstream;
+    let mut api_key = file_cfg.api_key;
 
-    if let Ok(s) = std::fs::read_to_string("config.json") {
-        if let Ok(v) = serde_json::from_str::<Value>(&s) {
-            if let Some(o) = v.as_object() {
-                if let Some(p) = o.get("port").and_then(Value::as_u64) {
-                    port = p as u16;
-                }
-                if let Some(u) = o.get("upstream").and_then(Value::as_str) {
-                    upstream = u.to_string();
-                }
-                if let Some(p) = o.get("patch") {
-                    patch = p.clone();
-                }
-                if let Some(r) = o.get("rename") {
-                    rename = r.clone();
-                }
-                if let Some(k) = o.get("api_key").and_then(Value::as_str) {
-                    api_key = Some(k.to_string());
-                }
-            }
+    if let Some(value) = env_value("PORT")? {
+        port = value
+            .parse::<u16>()
+            .map_err(|_| format!("invalid PORT {value:?}: expected 1..=65535"))?;
+        if port == 0 {
+            return Err("invalid PORT \"0\": expected 1..=65535".to_string());
         }
     }
-    if let Ok(p) = std::env::var("PORT") {
-        if let Ok(p) = p.parse() {
-            port = p;
-        }
+    if let Some(value) = env_value("UPSTREAM")? {
+        upstream = Some(value);
     }
-    if let Ok(u) = std::env::var("UPSTREAM") {
-        upstream = u;
+    if let Some(value) = env_value("API_KEY")? {
+        api_key = Some(value);
     }
-    if let Ok(k) = std::env::var("API_KEY") {
-        api_key = Some(k);
-    }
-    upstream = upstream.trim_end_matches('/').to_string();
 
-    Cfg {
+    let upstream = upstream.ok_or("missing upstream: set config.json upstream or UPSTREAM")?;
+    let upstream = upstream.trim_end_matches('/').to_string();
+    validate_upstream(&upstream)?;
+    if api_key.as_deref().is_some_and(str::is_empty) {
+        return Err("api_key/API_KEY must not be empty".to_string());
+    }
+
+    Ok(Cfg {
         port,
         upstream,
-        patch,
-        rename,
-        debug,
+        patch: file_cfg.patch,
+        rename: file_cfg.rename,
+        debug: std::env::args().any(|a| a == "--debug"),
         api_key,
         client: reqwest::Client::new(),
+    })
+}
+
+fn parse_file_cfg(s: &str) -> Result<FileCfg, String> {
+    let cfg =
+        serde_json::from_str::<FileCfg>(s).map_err(|e| format!("invalid config.json: {e}"))?;
+    if cfg.port == Some(0) {
+        return Err("invalid config.json port: expected 1..=65535".to_string());
     }
+    if cfg.upstream.as_deref().is_some_and(str::is_empty) {
+        return Err("config.json upstream must not be empty".to_string());
+    }
+    if !cfg.patch.is_null() && !cfg.patch.is_object() {
+        return Err("config.json patch must be an object or null".to_string());
+    }
+    if !cfg.rename.is_null() && !cfg.rename.is_object() {
+        return Err("config.json rename must be an object or null".to_string());
+    }
+    if cfg
+        .rename
+        .as_object()
+        .is_some_and(|rename| rename.values().any(|value| !value.is_string()))
+    {
+        return Err("config.json rename values must be strings".to_string());
+    }
+    if cfg.api_key.as_deref().is_some_and(str::is_empty) {
+        return Err("config.json api_key must not be empty".to_string());
+    }
+    Ok(cfg)
+}
+
+fn env_value(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(format!("invalid {name}: {e}")),
+    }
+}
+
+fn validate_upstream(upstream: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(upstream).map_err(|e| format!("invalid upstream URL: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("upstream must be an absolute http:// or https:// URL".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("upstream must not contain a query or fragment".to_string());
+    }
+    Ok(())
 }
 
 /// 字段改名: rename {"max_tokens": "max_completion_tokens"} 把请求体顶层同名 key 改名。
@@ -127,12 +186,22 @@ fn apply_patch(body: &mut Vec<u8>, patch: &Value) {
     }
 }
 
-fn is_skipped(name: &str) -> bool {
-    SKIP_HEADERS.contains(&name)
+fn is_request_skipped(name: &str) -> bool {
+    is_hop_by_hop(name) || REQUEST_REBUILT.contains(&name)
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
     HOP_BY_HOP.contains(&name)
+}
+
+fn connection_lists_header(value: &str, name: &str) -> bool {
+    value
+        .split(',')
+        .any(|candidate| candidate.trim().eq_ignore_ascii_case(name))
+}
+
+fn is_connection_named<'a>(mut values: impl Iterator<Item = &'a str>, name: &str) -> bool {
+    values.any(|value| connection_lists_header(value, name))
 }
 
 async fn proxy(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, actix_web::Error> {
@@ -160,9 +229,17 @@ async fn proxy(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, actix
     // ponytail: 字符串桥接 actix(http 0.2) 与 reqwest(http 1.x) 的 header 类型
     let mut headers = reqwest::header::HeaderMap::new();
     let mut has_auth = false;
+    // ponytail: header 数量很小；逐项重扫 Connection token，避免每请求分配集合。
     for (k, v) in req.headers().iter() {
         let name = k.as_str();
-        if is_skipped(name) {
+        if is_request_skipped(name)
+            || is_connection_named(
+                req.headers()
+                    .get_all(header::CONNECTION)
+                    .filter_map(|value| value.to_str().ok()),
+                name,
+            )
+        {
             continue;
         }
         let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
@@ -216,11 +293,17 @@ async fn proxy(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, actix
     let mut resp = HttpResponse::build(status);
     for (k, v) in res.headers().iter() {
         let name = k.as_str();
-        // content-encoding/content-length 随 reqwest 自动解压失效, 剥离避免客户端误判 (gzip: invalid header)
-        if is_hop_by_hop(name) || name == "content-encoding" || name == "content-length" {
-            continue;
-        }
-        if is_hop_by_hop(name) {
+        // BodyStream 重新生成传输 framing；reqwest 未启用解压 feature，保留 content-encoding。
+        if is_hop_by_hop(name)
+            || name == "content-length"
+            || is_connection_named(
+                res.headers()
+                    .get_all(reqwest::header::CONNECTION)
+                    .iter()
+                    .filter_map(|value| value.to_str().ok()),
+                name,
+            )
+        {
             continue;
         }
         // 非法 header 值丢弃, 不阻断响应
@@ -236,7 +319,7 @@ async fn proxy(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, actix
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let cfg = load_cfg();
+    let cfg = load_cfg().map_err(std::io::Error::other)?;
     if cfg.debug {
         eprintln!("debug: on (request logs on stderr)");
     }
@@ -271,10 +354,175 @@ async fn main() -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    fn test_cfg(upstream: String) -> Cfg {
+        Cfg {
+            port: 8080,
+            upstream,
+            patch: serde_json::json!({"reasoning_effort": "high"}),
+            rename: serde_json::json!({"max_tokens": "max_completion_tokens"}),
+            debug: false,
+            api_key: Some("test-key".to_string()),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    fn raw_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        head.lines().skip(1).find_map(|line| {
+            let (candidate, value) = line.split_once(':')?;
+            candidate.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    fn spawn_asserting_upstream() -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            let body_start = loop {
+                if let Some(offset) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break offset + 4;
+                }
+                let read = stream.read(&mut buf).unwrap();
+                assert!(read > 0, "upstream request ended before its headers");
+                request.extend_from_slice(&buf[..read]);
+            };
+            let head = std::str::from_utf8(&request[..body_start])
+                .unwrap()
+                .to_owned();
+            let content_length = raw_header(&head, "content-length")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            while request.len() < body_start + content_length {
+                let read = stream.read(&mut buf).unwrap();
+                assert!(read > 0, "upstream request ended before its body");
+                request.extend_from_slice(&buf[..read]);
+            }
+
+            assert!(head.starts_with("POST /v1/chat/completions?probe=1 HTTP/1.1\r\n"));
+            assert_eq!(raw_header(&head, "authorization"), Some("Bearer test-key"));
+            assert_eq!(raw_header(&head, "user-agent"), Some(BROWSER_UA));
+            assert_eq!(raw_header(&head, "x-request-id"), Some("request-42"));
+            assert_eq!(raw_header(&head, "connection"), None);
+            assert_eq!(raw_header(&head, "x-client-hop"), None);
+            assert_eq!(raw_header(&head, "te"), None);
+            let body: Value =
+                serde_json::from_slice(&request[body_start..body_start + content_length]).unwrap();
+            assert_eq!(body["model"], "demo");
+            assert_eq!(body["max_completion_tokens"], 128);
+            assert_eq!(body["reasoning_effort"], "high");
+
+            let response_body = br#"{"ok":true}"#;
+            write!(
+                stream,
+                "HTTP/1.1 201 Created\r\nConnection: x-upstream-hop\r\nX-Upstream-Hop: secret\r\nContent-Encoding: gzip\r\nX-Upstream: ok\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                response_body.len()
+            )
+            .unwrap();
+            stream.write_all(response_body).unwrap();
+        });
+        (format!("http://{addr}"), thread)
+    }
+
+    #[test]
+    fn invalid_config_is_rejected() {
+        for config in [
+            "{",
+            r#"{"port":0}"#,
+            r#"{"port":70000}"#,
+            r#"{"patch":[]}"#,
+            r#"{"rename":{"old":1}}"#,
+            r#"{"api_key":""}"#,
+        ] {
+            assert!(parse_file_cfg(config).is_err(), "accepted {config}");
+        }
+        assert!(validate_upstream("ftp://example.com").is_err());
+        assert!(validate_upstream("https://example.com?token=x").is_err());
+    }
+
+    #[actix_web::test]
+    async fn proxy_rewrites_request_and_filters_hop_headers() {
+        let (upstream, upstream_thread) = spawn_asserting_upstream();
+
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_cfg(upstream)))
+                .service(web::resource("/{path:.*}").route(web::to(proxy))),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::post()
+            .uri("/v1/chat/completions?probe=1")
+            .insert_header((header::CONTENT_TYPE, "application/json"))
+            .insert_header((header::CONNECTION, "x-client-hop"))
+            .insert_header(("x-client-hop", "secret"))
+            .insert_header((header::TE, "trailers"))
+            .insert_header(("x-request-id", "request-42"))
+            .set_payload(r#"{"model":"demo","max_tokens":128}"#)
+            .to_request();
+        let response = actix_web::test::call_service(&app, req).await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-upstream")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "gzip"
+        );
+        assert!(!response.headers().contains_key(header::CONNECTION));
+        assert!(!response.headers().contains_key("x-upstream-hop"));
+        let payload: Value =
+            serde_json::from_slice(&actix_web::test::read_body(response).await).unwrap();
+        assert_eq!(payload["ok"], true);
+        upstream_thread.join().unwrap();
+    }
+
+    #[actix_web::test]
+    async fn proxy_returns_bad_gateway_for_upstream_error() {
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(test_cfg("http://127.0.0.1:0".to_string())))
+                .service(web::resource("/{path:.*}").route(web::to(proxy))),
+        )
+        .await;
+        let request = actix_web::test::TestRequest::post()
+            .uri("/v1/chat/completions")
+            .set_payload("{}")
+            .to_request();
+        let response = actix_web::test::call_service(&app, request).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = actix_web::test::read_body(response).await;
+        assert!(std::str::from_utf8(&body)
+            .unwrap()
+            .starts_with("upstream error:"));
+    }
+
     #[test]
     fn rename_field() {
         let mut body = br#"{"model":"m","max_tokens":2048}"#.to_vec();
-        apply_rename(&mut body, &serde_json::json!({"max_tokens": "max_completion_tokens"}));
+        apply_rename(
+            &mut body,
+            &serde_json::json!({"max_tokens": "max_completion_tokens"}),
+        );
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert!(v.get("max_tokens").is_none());
         assert_eq!(v["max_completion_tokens"], 2048);
@@ -283,9 +531,15 @@ mod tests {
     #[test]
     fn rename_then_patch() {
         let mut body = br#"{"max_tokens":100}"#.to_vec();
-        apply_rename(&mut body, &serde_json::json!({"max_tokens": "max_completion_tokens"}));
+        apply_rename(
+            &mut body,
+            &serde_json::json!({"max_tokens": "max_completion_tokens"}),
+        );
         // rename 后字段名已变, patch 需操作新名字
-        apply_patch(&mut body, &serde_json::json!({"max_completion_tokens": 8192}));
+        apply_patch(
+            &mut body,
+            &serde_json::json!({"max_completion_tokens": 8192}),
+        );
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["max_completion_tokens"], 8192);
         assert!(v.get("max_tokens").is_none());
