@@ -58,6 +58,8 @@ Windows 或需要指定版本时，到 [Releases](https://github.com/ycvk/airout
 
 解压后 `cd` 进解压目录，创建 `config.json`（格式参见 [`config.example.json`](config.example.json)），再运行 `airouter-proxy`（Windows 为 `airouter-proxy.exe`）。配置文件按运行目录（cwd）查找，不是二进制所在目录。
 
+Linux 包是 musl 静态链接的，不依赖系统 glibc 版本，任何发行版解压即可运行。
+
 ## 从源码运行
 
 需要 Rust stable toolchain。

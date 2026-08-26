@@ -33,7 +33,17 @@ jobs:
         run: cargo test --locked
 
       - name: Build release binary
+        if: runner.os != 'Linux'
         run: cargo build --release --locked
+
+      # ubuntu-latest 的 glibc 2.39 会让产物要求 GLIBC_2.38+, 在旧发行版上直接跑不起来。
+      # 换成 musl 静态链接, 任何 Linux 都能执行。
+      - name: Build static Linux binary (musl)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p target/release
+          docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/tmp/t rust:alpine \
+            sh -c 'apk add --no-cache build-base cmake perl && cargo build --release --locked && cp /tmp/t/release/airouter-proxy target/release/'
 
       - name: Package Unix binary
         if: runner.os != 'Windows'
