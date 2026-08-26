@@ -4,6 +4,34 @@
 
 一个小型 HTTP 反向代理，用于在请求转发到上游 API 前改写顶层 JSON 字段，并流式返回上游响应。
 
+## 快速开始
+
+下载最新版预编译二进制，按平台选一条：
+
+```bash
+# macOS (Apple Silicon)
+curl -fsSL https://github.com/ycvk/airouter-proxy/releases/latest/download/airouter-proxy-macos-arm64.tar.gz | tar xz
+
+# Linux x86_64
+curl -fsSL https://github.com/ycvk/airouter-proxy/releases/latest/download/airouter-proxy-linux-x86_64.tar.gz | tar xz
+```
+
+直接运行，上游地址和 key 用环境变量给：
+
+```bash
+UPSTREAM=https://api.example.com API_KEY=sk-example ./airouter-proxy
+```
+
+不放 `config.json` 也能跑，此时只转发并补 `Authorization`，不改写请求体；要改写字段见[配置](#配置)。
+
+验证：
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"example","max_tokens":1024,"stream":true}'
+```
+
 ## 功能
 
 - 保留请求 method、path 和 query。
@@ -18,9 +46,9 @@
 - 上游连接超时 10s；不设整体超时，避免中断 SSE 长连接。
 - 上游启用 HTTP/2，多个流复用一条连接（按 ALPN 协商，上游不支持时回落 HTTP/1.1）。
 
-## 下载
+## 手动下载
 
-从 [Latest Release](https://github.com/ycvk/airouter-proxy/releases/latest) 下载对应平台的预编译包：
+Windows 或需要指定版本时，到 [Releases](https://github.com/ycvk/airouter-proxy/releases/latest) 下载：
 
 | 平台 | 文件 |
 | --- | --- |
@@ -45,15 +73,6 @@ cargo run --release
 
 ```bash
 cargo run --release -- --debug
-```
-
-请求示例：
-
-```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -H 'authorization: Bearer client-key' \
-  -d '{"model":"example","max_tokens":1024,"stream":true}'
 ```
 
 ## 配置
