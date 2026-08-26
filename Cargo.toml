@@ -4,7 +4,13 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-actix-web = "4"
+# 不用 actix 的 Compress 中间件(上游 content-encoding 原样透传)、cookie 和路由 unicode 正则:
+# 关掉默认 features 省 1.9MB。unicode 只影响路由匹配, 而 URI 解析层已保证 path 是 ASCII。
+actix-web = { version = "4", default-features = false, features = ["macros", "http2"] }
 reqwest = { version = "0.13", default-features = false, features = ["http2", "stream", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+
+[profile.release]
+# 发布二进制不带符号表(-2MB); 代价是 panic backtrace 无符号名
+strip = true
