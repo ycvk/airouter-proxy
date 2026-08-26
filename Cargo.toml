@@ -2,6 +2,7 @@
 name = "airouter-proxy"
 version = "0.2.1"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 # 不用 actix 的 Compress 中间件(上游 content-encoding 原样透传)、cookie 和路由 unicode 正则:

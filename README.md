@@ -129,3 +129,7 @@ cargo fmt -- --check
 - 不要提交包含真实凭据的 `config.json`。
 - `--debug` 会记录完整请求体，只应在受控环境中使用。
 - 客户端自己提供的 `Authorization` 优先于配置的 `api_key`。
+
+## 许可
+
+[MIT](LICENSE)
