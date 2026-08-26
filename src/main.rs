@@ -2,30 +2,20 @@ use actix_web::body::BodyStream;
 use actix_web::http::{header, StatusCode};
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
-// RFC 9110 §7.6.1 固定逐跳头；Connection 还可动态指定其他逐跳头。
-const HOP_BY_HOP: [&str; 8] = [
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-];
-// reqwest 必须按改写后的 body 和上游 URL 重建这些头。
-const REQUEST_REBUILT: [&str; 2] = ["content-length", "host"];
 // 上游可能按 UA 区分浏览器/客户端流量, 用真实 Chrome UA 而非 reqwest 默认
 const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 
-#[derive(Clone)]
 struct Cfg {
     port: u16,
     upstream: String,
-    patch: Value,
-    rename: Value,
+    /// 顶层字段改名 (from, to)
+    rename: Vec<(String, String)>,
+    /// 顶层浅合并, None 表示删除该 key; 预转成 RawValue, 热路径直接拼字节
+    patch: Vec<(String, Option<Box<RawValue>>)>,
     debug: bool,
     api_key: Option<String>,
     client: reqwest::Client,
@@ -78,11 +68,16 @@ fn load_cfg() -> Result<Cfg, String> {
     Ok(Cfg {
         port,
         upstream,
-        patch: file_cfg.patch,
-        rename: file_cfg.rename,
+        rename: rename_pairs(&file_cfg.rename),
+        patch: patch_pairs(&file_cfg.patch),
         debug: std::env::args().any(|a| a == "--debug"),
         api_key,
-        client: reqwest::Client::new(),
+        client: reqwest::Client::builder()
+            // 不设整体 timeout: 会误杀长 SSE 流; 只兜住连不上和空闲池连接
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .build()
+            .map_err(|e| format!("cannot build http client: {e}"))?,
     })
 }
 
@@ -133,65 +128,74 @@ fn validate_upstream(upstream: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 字段改名: rename {"max_tokens": "max_completion_tokens"} 把请求体顶层同名 key 改名。
-fn apply_rename(body: &mut Vec<u8>, rename: &Value) {
+/// config 的 rename/patch 预转成热路径可直接用的形式, 避免每请求重新走 Value。
+fn rename_pairs(rename: &Value) -> Vec<(String, String)> {
     let Some(map) = rename.as_object() else {
-        return;
+        return Vec::new();
     };
-    if map.is_empty() {
-        return;
-    }
-    let Ok(mut v) = serde_json::from_slice::<Value>(body) else {
-        return;
-    };
-    let Some(obj) = v.as_object_mut() else {
-        return;
-    };
-    for (from, to) in map {
-        let Some(to) = to.as_str() else {
-            continue;
-        };
-        if let Some(val) = obj.remove(from) {
-            obj.insert(to.to_string(), val);
-        }
-    }
-    if let Ok(b) = serde_json::to_vec(&v) {
-        *body = b;
-    }
+    map.iter()
+        .filter_map(|(from, to)| to.as_str().map(|to| (from.clone(), to.to_string())))
+        .collect()
 }
 
-/// 把 patch 浅合并进请求体顶层 JSON 对象; patch 值为 null 表示删除该 key。
-fn apply_patch(body: &mut Vec<u8>, patch: &Value) {
-    let Some(patch) = patch.as_object() else {
-        return;
+fn patch_pairs(patch: &Value) -> Vec<(String, Option<Box<RawValue>>)> {
+    let Some(map) = patch.as_object() else {
+        return Vec::new();
     };
-    if patch.is_empty() {
-        return;
+    map.iter()
+        .map(|(k, val)| {
+            // 已解析的 Value 不含 NaN/Inf, 重新序列化不会失败
+            let raw = (!val.is_null())
+                .then(|| serde_json::value::to_raw_value(val).expect("patch value re-serializes"));
+            (k.clone(), raw)
+        })
+        .collect()
+}
+
+/// 顶层改写: 先按 rename 改名, 再浅合并 patch(None 表示删除该 key)。
+/// 只解析顶层 key, 嵌套内容按原始字节透传(不重排 key、不规范化数字字面量)。
+/// 返回 None 表示无需改写, 调用方零拷贝转发原 body。
+fn rewrite_body<'a>(
+    body: &'a [u8],
+    rename: &'a [(String, String)],
+    patch: &'a [(String, Option<Box<RawValue>>)],
+) -> Option<Vec<u8>> {
+    if rename.is_empty() && patch.is_empty() {
+        return None;
     }
-    let Ok(mut v) = serde_json::from_slice::<Value>(body) else {
-        return;
-    };
-    let Some(obj) = v.as_object_mut() else {
-        return;
-    };
+    let mut obj: BTreeMap<String, &'a RawValue> = serde_json::from_slice(body).ok()?;
+    for (from, to) in rename {
+        if let Some(val) = obj.remove(from.as_str()) {
+            obj.insert(to.clone(), val);
+        }
+    }
     for (k, val) in patch {
-        if val.is_null() {
-            obj.remove(k);
-        } else {
-            obj.insert(k.clone(), val.clone());
-        }
+        match val {
+            Some(raw) => obj.insert(k.clone(), raw),
+            None => obj.remove(k.as_str()),
+        };
     }
-    if let Ok(b) = serde_json::to_vec(&v) {
-        *body = b;
-    }
+    serde_json::to_vec(&obj).ok()
 }
 
+// reqwest 按改写后的 body 和上游 URL 重建 content-length/host。
 fn is_request_skipped(name: &str) -> bool {
-    is_hop_by_hop(name) || REQUEST_REBUILT.contains(&name)
+    is_hop_by_hop(name) || matches!(name, "content-length" | "host")
 }
 
+// RFC 9110 §7.6.1 固定逐跳头; Connection 还可动态指定其他逐跳头。
 fn is_hop_by_hop(name: &str) -> bool {
-    HOP_BY_HOP.contains(&name)
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 fn connection_lists_header(value: &str, name: &str) -> bool {
@@ -210,45 +214,43 @@ async fn proxy(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, actix
         .expect("cfg registered")
         .clone();
 
-    // 原样保留 path + query, 例如 /v1/chat/completions?x=1
-    let path = req.uri().to_string();
-    let mut body = body.to_vec();
-    // 先改名再 patch: renamed 后的字段名即为上游最终字段, patch 直接操作它
-    apply_rename(&mut body, &cfg.rename);
-    apply_patch(&mut body, &cfg.patch);
+    // path_and_query 保留 query, 并剥掉 absolute-form 的 scheme+authority
+    let path = req.uri().path_and_query().map_or("/", |pq| pq.as_str());
+    // 未命中改写时原 Bytes 直接下发(与 reqwest 共用 bytes crate), 不多拷一份
+    let rewritten = rewrite_body(&body, &cfg.rename, &cfg.patch);
     if cfg.debug {
+        let out = rewritten.as_deref().unwrap_or(&body);
         eprintln!(
             "-> {} {} body={}B: {}",
             req.method(),
             path,
-            body.len(),
-            String::from_utf8_lossy(&body)
+            out.len(),
+            String::from_utf8_lossy(out)
         );
     }
+    let body = match rewritten {
+        Some(rewritten) => reqwest::Body::from(rewritten),
+        None => reqwest::Body::from(body),
+    };
 
     // ponytail: 字符串桥接 actix(http 0.2) 与 reqwest(http 1.x) 的 header 类型
-    let mut headers = reqwest::header::HeaderMap::new();
+    let mut headers = reqwest::header::HeaderMap::with_capacity(req.headers().len() + 2);
     let mut has_auth = false;
-    // ponytail: header 数量很小；逐项重扫 Connection token，避免每请求分配集合。
+    // Connection 列出的头也是逐跳的; 一次取出复用, 不在每个 header 上重查
+    let conn_tokens: Vec<&str> = req
+        .headers()
+        .get_all(header::CONNECTION)
+        .filter_map(|value| value.to_str().ok())
+        .collect();
     for (k, v) in req.headers().iter() {
         let name = k.as_str();
-        if is_request_skipped(name)
-            || is_connection_named(
-                req.headers()
-                    .get_all(header::CONNECTION)
-                    .filter_map(|value| value.to_str().ok()),
-                name,
-            )
-        {
+        if is_request_skipped(name) || is_connection_named(conn_tokens.iter().copied(), name) {
             continue;
         }
         let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
             continue; // 非法 header 名丢弃
         };
-        let Some(s) = v.to_str().ok() else {
-            continue;
-        };
-        let Ok(val) = s.parse::<reqwest::header::HeaderValue>() else {
+        let Ok(val) = reqwest::header::HeaderValue::from_bytes(v.as_bytes()) else {
             continue; // 非法 header 值丢弃
         };
         has_auth = has_auth || name == reqwest::header::AUTHORIZATION;
@@ -288,27 +290,28 @@ async fn proxy(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, actix
 
     let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if cfg.debug {
-        eprintln!("<- {status} {path}");
+        eprintln!("<- {status} {:?} {path}", res.version());
     }
     let mut resp = HttpResponse::build(status);
-    for (k, v) in res.headers().iter() {
-        let name = k.as_str();
-        // BodyStream 重新生成传输 framing；reqwest 未启用解压 feature，保留 content-encoding。
-        if is_hop_by_hop(name)
-            || name == "content-length"
-            || is_connection_named(
-                res.headers()
-                    .get_all(reqwest::header::CONNECTION)
-                    .iter()
-                    .filter_map(|value| value.to_str().ok()),
-                name,
-            )
-        {
-            continue;
-        }
-        // 非法 header 值丢弃, 不阻断响应
-        if let Ok(s) = v.to_str() {
-            if let Ok(val) = s.parse::<header::HeaderValue>() {
+    {
+        // 同样一次取出 Connection token; Vec 借用 res.headers(), 块结束后才能 move res
+        let conn_tokens: Vec<&str> = res
+            .headers()
+            .get_all(reqwest::header::CONNECTION)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        for (k, v) in res.headers().iter() {
+            let name = k.as_str();
+            // BodyStream 重新生成传输 framing；reqwest 未启用解压 feature，保留 content-encoding。
+            if is_hop_by_hop(name)
+                || name == "content-length"
+                || is_connection_named(conn_tokens.iter().copied(), name)
+            {
+                continue;
+            }
+            // 非法 header 值丢弃, 不阻断响应
+            if let Ok(val) = header::HeaderValue::from_bytes(v.as_bytes()) {
                 resp.append_header((name, val));
             }
         }
@@ -323,30 +326,28 @@ async fn main() -> std::io::Result<()> {
     if cfg.debug {
         eprintln!("debug: on (request logs on stderr)");
     }
-    if let Some(p) = cfg.patch.as_object() {
-        if !p.is_empty() {
-            println!("patch: {p:?}");
-        }
+    for (from, to) in &cfg.rename {
+        println!("rename: {from} -> {to}");
     }
-    if let Some(r) = cfg.rename.as_object() {
-        if !r.is_empty() {
-            println!("rename: {r:?}");
-        }
+    for (k, val) in &cfg.patch {
+        println!(
+            "patch: {k} = {}",
+            val.as_deref().map_or("<removed>", RawValue::get)
+        );
     }
 
-    let server_cfg = cfg.clone();
+    let (port, upstream) = (cfg.port, cfg.upstream.clone());
+    // Data 只建一次, 各 worker clone 的是 Arc, 不再每 worker 深拷一份配置
+    let data = web::Data::new(cfg);
     let app = HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::new(server_cfg.clone()))
+            .app_data(data.clone())
             .app_data(web::PayloadConfig::new(16 << 20)) // ponytail: 长对话 JSON 常超默认 256KB; 16MB 足够, 再大按需调
             .service(web::resource("/{path:.*}").route(web::to(proxy)))
     })
-    .bind(("0.0.0.0", cfg.port))?; // 0.0.0.0: 供 OrbStack 容器内 pentagi 经 orb.local (VM 网关) 访问
+    .bind(("0.0.0.0", port))?; // 0.0.0.0: 供 OrbStack 容器内 pentagi 经 orb.local (VM 网关) 访问
 
-    println!(
-        "listening on http://127.0.0.1:{}  ->  {}",
-        cfg.port, cfg.upstream
-    );
+    println!("listening on http://127.0.0.1:{port}  ->  {upstream}");
     app.run().await
 }
 
@@ -358,8 +359,8 @@ mod tests {
         Cfg {
             port: 8080,
             upstream,
-            patch: serde_json::json!({"reasoning_effort": "high"}),
-            rename: serde_json::json!({"max_tokens": "max_completion_tokens"}),
+            rename: rename_pairs(&serde_json::json!({"max_tokens": "max_completion_tokens"})),
+            patch: patch_pairs(&serde_json::json!({"reasoning_effort": "high"})),
             debug: false,
             api_key: Some("test-key".to_string()),
             client: reqwest::Client::new(),
@@ -371,6 +372,17 @@ mod tests {
             let (candidate, value) = line.split_once(':')?;
             candidate.eq_ignore_ascii_case(name).then(|| value.trim())
         })
+    }
+
+    fn probe_request(uri: &str) -> actix_web::test::TestRequest {
+        actix_web::test::TestRequest::post()
+            .uri(uri)
+            .insert_header((header::CONTENT_TYPE, "application/json"))
+            .insert_header((header::CONNECTION, "x-client-hop"))
+            .insert_header(("x-client-hop", "secret"))
+            .insert_header((header::TE, "trailers"))
+            .insert_header(("x-request-id", "request-42"))
+            .set_payload(r#"{"model":"demo","max_tokens":128}"#)
     }
 
     fn spawn_asserting_upstream() -> (String, std::thread::JoinHandle<()>) {
@@ -449,50 +461,47 @@ mod tests {
 
     #[actix_web::test]
     async fn proxy_rewrites_request_and_filters_hop_headers() {
-        let (upstream, upstream_thread) = spawn_asserting_upstream();
+        // origin-form, 以及客户端把本代理当 HTTP proxy 时的 absolute-form, 都必须以 origin-form 发给上游
+        for uri in [
+            "/v1/chat/completions?probe=1",
+            "http://proxy.invalid/v1/chat/completions?probe=1",
+        ] {
+            let (upstream, upstream_thread) = spawn_asserting_upstream();
+            let app = actix_web::test::init_service(
+                App::new()
+                    .app_data(web::Data::new(test_cfg(upstream)))
+                    .service(web::resource("/{path:.*}").route(web::to(proxy))),
+            )
+            .await;
+            let response =
+                actix_web::test::call_service(&app, probe_request(uri).to_request()).await;
 
-        let app = actix_web::test::init_service(
-            App::new()
-                .app_data(web::Data::new(test_cfg(upstream)))
-                .service(web::resource("/{path:.*}").route(web::to(proxy))),
-        )
-        .await;
-        let req = actix_web::test::TestRequest::post()
-            .uri("/v1/chat/completions?probe=1")
-            .insert_header((header::CONTENT_TYPE, "application/json"))
-            .insert_header((header::CONNECTION, "x-client-hop"))
-            .insert_header(("x-client-hop", "secret"))
-            .insert_header((header::TE, "trailers"))
-            .insert_header(("x-request-id", "request-42"))
-            .set_payload(r#"{"model":"demo","max_tokens":128}"#)
-            .to_request();
-        let response = actix_web::test::call_service(&app, req).await;
-
-        assert_eq!(response.status(), StatusCode::CREATED);
-        assert_eq!(
-            response
-                .headers()
-                .get("x-upstream")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "ok"
-        );
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CONTENT_ENCODING)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "gzip"
-        );
-        assert!(!response.headers().contains_key(header::CONNECTION));
-        assert!(!response.headers().contains_key("x-upstream-hop"));
-        let payload: Value =
-            serde_json::from_slice(&actix_web::test::read_body(response).await).unwrap();
-        assert_eq!(payload["ok"], true);
-        upstream_thread.join().unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED, "uri {uri}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-upstream")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "ok"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_ENCODING)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "gzip"
+            );
+            assert!(!response.headers().contains_key(header::CONNECTION));
+            assert!(!response.headers().contains_key("x-upstream-hop"));
+            let payload: Value =
+                serde_json::from_slice(&actix_web::test::read_body(response).await).unwrap();
+            assert_eq!(payload["ok"], true);
+            upstream_thread.join().unwrap();
+        }
     }
 
     #[actix_web::test]
@@ -518,59 +527,70 @@ mod tests {
 
     #[test]
     fn rename_field() {
-        let mut body = br#"{"model":"m","max_tokens":2048}"#.to_vec();
-        apply_rename(
-            &mut body,
-            &serde_json::json!({"max_tokens": "max_completion_tokens"}),
-        );
-        let v: Value = serde_json::from_slice(&body).unwrap();
+        let out = rewrite_body(
+            br#"{"model":"m","max_tokens":2048}"#,
+            &rename_pairs(&serde_json::json!({"max_tokens": "max_completion_tokens"})),
+            &[],
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
         assert!(v.get("max_tokens").is_none());
         assert_eq!(v["max_completion_tokens"], 2048);
     }
 
     #[test]
     fn rename_then_patch() {
-        let mut body = br#"{"max_tokens":100}"#.to_vec();
-        apply_rename(
-            &mut body,
-            &serde_json::json!({"max_tokens": "max_completion_tokens"}),
-        );
-        // rename 后字段名已变, patch 需操作新名字
-        apply_patch(
-            &mut body,
-            &serde_json::json!({"max_completion_tokens": 8192}),
-        );
-        let v: Value = serde_json::from_slice(&body).unwrap();
+        // rename 先跑, 所以 patch 操作的是改名后的字段
+        let out = rewrite_body(
+            br#"{"max_tokens":100}"#,
+            &rename_pairs(&serde_json::json!({"max_tokens": "max_completion_tokens"})),
+            &patch_pairs(&serde_json::json!({"max_completion_tokens": 8192})),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["max_completion_tokens"], 8192);
         assert!(v.get("max_tokens").is_none());
     }
 
     #[test]
     fn patch_merge_and_remove() {
-        let mut body = br#"{"model":"old","stream":true}"#.to_vec();
-        apply_patch(
-            &mut body,
-            &serde_json::json!({"model": "new", "extra": 1, "stream": null}),
-        );
-        let v: Value = serde_json::from_slice(&body).unwrap();
+        let out = rewrite_body(
+            br#"{"model":"old","stream":true}"#,
+            &[],
+            &patch_pairs(&serde_json::json!({"model": "new", "extra": 1, "stream": null})),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["model"], "new");
         assert_eq!(v["extra"], 1);
         assert!(v.get("stream").is_none());
     }
 
     #[test]
-    fn patch_non_json_noop() {
-        let mut body = b"not json".to_vec();
-        apply_patch(&mut body, &serde_json::json!({"model": "new"}));
-        assert_eq!(body, b"not json");
+    fn nested_bytes_pass_through_untouched() {
+        // 只解析顶层: 嵌套 key 顺序和数字字面量按原始字节透传
+        let out = rewrite_body(
+            br#"{"max_tokens":1,"tools":[{"z":1.50,"a":{"b":[3,2]}}]}"#,
+            &rename_pairs(&serde_json::json!({"max_tokens": "max_completion_tokens"})),
+            &[],
+        )
+        .unwrap();
+        let out = std::str::from_utf8(&out).unwrap();
+        assert!(out.contains(r#"{"z":1.50,"a":{"b":[3,2]}}"#), "{out}");
     }
 
     #[test]
-    fn patch_null_or_non_object_noop() {
-        let mut body = br#"{"model":"old"}"#.to_vec();
-        let mut body2 = body.clone();
-        apply_patch(&mut body, &Value::Null);
-        apply_patch(&mut body2, &serde_json::json!([1, 2]));
-        assert_eq!(body, body2);
+    fn nothing_to_rewrite_returns_none() {
+        // 空配置 / 非 JSON / 顶层非 object: 调用方原样零拷贝转发
+        let patch = patch_pairs(&serde_json::json!({"model": "new"}));
+        assert!(rewrite_body(br#"{"model":"old"}"#, &[], &[]).is_none());
+        assert!(rewrite_body(b"not json", &[], &patch).is_none());
+        assert!(rewrite_body(br#"[1,2]"#, &[], &patch).is_none());
+        assert!(rewrite_body(
+            br#"{"a":1}"#,
+            &rename_pairs(&Value::Null),
+            &patch_pairs(&serde_json::json!([1, 2])),
+        )
+        .is_none());
     }
 }

@@ -9,9 +9,12 @@
 - 保留请求 method、path 和 query。
 - 按 `rename` 重命名顶层 JSON 字段，再浅合并 `patch`。
 - `patch` 中值为 `null` 的字段会从请求体删除。
+- 只解析请求体顶层字段，嵌套内容按原始字节透传（不重排 key、不规范化数字）。
 - 客户端未提供 `Authorization` 时，使用配置的 API key。
 - 过滤逐跳 HTTP headers，流式转发 SSE/chunked 响应。
 - 单个请求体最大 16 MiB。
+- 上游连接超时 10s；不设整体超时，避免中断 SSE 长连接。
+- 上游启用 HTTP/2，多个流复用一条连接（按 ALPN 协商，上游不支持时回落 HTTP/1.1）。
 
 ## 下载
 
