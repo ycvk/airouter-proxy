@@ -11,7 +11,9 @@
 - `patch` 中值为 `null` 的字段会从请求体删除。
 - 只解析请求体顶层字段，嵌套内容按原始字节透传（不重排 key、不规范化数字）。
 - 客户端未提供 `Authorization` 时，使用配置的 API key。
-- 过滤逐跳 HTTP headers，流式转发 SSE/chunked 响应。
+- `User-Agent` 统一改写为桌面 Chrome，客户端原值不透传。
+- 过滤逐跳 HTTP headers（含 `Connection` 动态列出的头），流式转发 SSE/chunked 响应。
+- 上游连接失败时返回 502，body 为 `upstream error: <原因>`。
 - 单个请求体最大 16 MiB。
 - 上游连接超时 10s；不设整体超时，避免中断 SSE 长连接。
 - 上游启用 HTTP/2，多个流复用一条连接（按 ALPN 协商，上游不支持时回落 HTTP/1.1）。
@@ -26,7 +28,7 @@
 | macOS Apple Silicon | `airouter-proxy-macos-arm64.tar.gz` |
 | Windows x86_64 | `airouter-proxy-windows-x86_64.zip` |
 
-解压后，在二进制同目录创建 `config.json`，配置格式参见 [`config.example.json`](config.example.json)，然后直接运行 `airouter-proxy`（Windows 为 `airouter-proxy.exe`）。
+解压后 `cd` 进解压目录，创建 `config.json`（格式参见 [`config.example.json`](config.example.json)），再运行 `airouter-proxy`（Windows 为 `airouter-proxy.exe`）。配置文件按运行目录（cwd）查找，不是二进制所在目录。
 
 ## 从源码运行
 
@@ -39,7 +41,7 @@ cargo run --release
 
 默认监听 `0.0.0.0:8080`。`config.json` 已被 Git 忽略。
 
-调试模式会把请求体写到 stderr：
+调试模式把请求体、响应状态和上游协商到的 HTTP 版本写到 stderr：
 
 ```bash
 cargo run --release -- --debug
@@ -61,7 +63,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `port` | 否 | 监听端口，范围 `1..=65535`，默认 `8080`。 |
-| `upstream` | 是 | 上游 `http://` 或 `https://` 地址，不允许 query 或 fragment。 |
+| `upstream` | 是 | 上游 `http://` 或 `https://` 地址，不允许 query 或 fragment；末尾 `/` 会被去掉。 |
 | `api_key` | 否 | 客户端未发送 `Authorization` 时使用。 |
 | `patch` | 否 | 浅合并到请求体顶层的 JSON object；值为 `null` 时删除字段。 |
 | `rename` | 否 | 顶层字段重命名映射，所有目标值必须是字符串。 |
@@ -100,10 +102,11 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt -- --check
 ```
 
-发布二进制位于 `target/release/airouter-proxy`。
+发布二进制位于 `target/release/airouter-proxy`，release profile 已开启 `strip`（不带符号表，panic backtrace 无符号名）。
 
 ## 安全提示
 
+- 默认绑定 `0.0.0.0` 且没有入站鉴权：任何能访问该端口的人都能借用配置的 `api_key`。只在受信网络暴露，或改绑 `127.0.0.1`。
 - 不要提交包含真实凭据的 `config.json`。
 - `--debug` 会记录完整请求体，只应在受控环境中使用。
 - 客户端自己提供的 `Authorization` 优先于配置的 `api_key`。
