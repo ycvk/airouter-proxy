@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 // 上游可能按 UA 区分浏览器/客户端流量, 用真实 Chrome UA 而非 reqwest 默认
@@ -24,6 +25,8 @@ struct Cfg {
     api_key: Option<String>,
     /// 并发上限; None 表示不限。permit 随响应体一起 drop, 见 PermitBody
     limit: Option<Arc<Semaphore>>,
+    /// 排队等额度的上限, 超时返回 503; 0 表示不排队, 没额度就直接 503
+    queue_timeout: Duration,
     client: reqwest::Client,
 }
 
@@ -32,6 +35,7 @@ struct FileCfg {
     port: Option<u16>,
     upstream: Option<String>,
     concurrency: Option<u32>,
+    queue_timeout: Option<u64>,
     #[serde(default)]
     patch: Value,
     #[serde(default)]
@@ -50,6 +54,7 @@ fn load_cfg() -> Result<Cfg, String> {
     let mut upstream = file_cfg.upstream;
     let mut api_key = file_cfg.api_key;
     let mut concurrency = file_cfg.concurrency;
+    let mut queue_timeout = file_cfg.queue_timeout;
 
     if let Some(value) = env_value("PORT")? {
         port = value
@@ -74,6 +79,19 @@ fn load_cfg() -> Result<Cfg, String> {
                 .ok_or_else(|| format!("invalid CONCURRENCY {value:?}: expected at least 1"))?,
         );
     }
+    if let Some(value) = env_value("QUEUE_TIMEOUT")? {
+        queue_timeout = Some(
+            value
+                .parse::<u64>()
+                .map_err(|_| format!("invalid QUEUE_TIMEOUT {value:?}: expected seconds"))?,
+        );
+    }
+    // 不限并发时排队超时是死配置, 直接报错而不是静默忽略
+    if queue_timeout.is_some() && concurrency.is_none() {
+        return Err(
+            "queue_timeout/QUEUE_TIMEOUT needs concurrency/CONCURRENCY to be set".to_string(),
+        );
+    }
 
     let upstream = upstream.ok_or("missing upstream: set config.json upstream or UPSTREAM")?;
     let upstream = upstream.trim_end_matches('/').to_string();
@@ -90,10 +108,12 @@ fn load_cfg() -> Result<Cfg, String> {
         debug: std::env::args().any(|a| a == "--debug"),
         api_key,
         limit: concurrency.map(|limit| Arc::new(Semaphore::new(limit as usize))),
+        // 默认 30s: 排队没有上限的话, 等待者会攥着已缓冲的请求体一直堆积
+        queue_timeout: Duration::from_secs(queue_timeout.unwrap_or(30)),
         client: reqwest::Client::builder()
             // 不设整体 timeout: 会误杀长 SSE 流; 只兜住连不上和空闲池连接
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Duration::from_secs(90))
             .build()
             // reqwest 的 Display 只有 "builder error"; Debug 带上 source 链, 最常见的原因是
             // 系统根证书缺失(最小化容器/镜像), rustls 拿不到 TLS root store。
@@ -319,14 +339,33 @@ async fn proxy(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, actix
         BROWSER_UA.parse().expect("static UA"),
     );
 
-    // ponytail: 无界排队, 不设等待超时; 要拒绝而不是排队再加 429 分支
     let permit = match &cfg.limit {
-        Some(sem) => Some(
-            sem.clone()
-                .acquire_owned()
-                .await
-                .expect("semaphore never closed"),
-        ),
+        Some(sem) => {
+            let queued = Instant::now();
+            let Ok(permit) =
+                tokio::time::timeout(cfg.queue_timeout, sem.clone().acquire_owned()).await
+            else {
+                if cfg.debug {
+                    eprintln!(
+                        "!! 503 {path}: queued {:?} without a slot",
+                        cfg.queue_timeout
+                    );
+                }
+                return Ok(HttpResponse::ServiceUnavailable()
+                    .content_type("text/plain")
+                    // 纯提示: 上游什么时候放出额度我们并不知道
+                    .insert_header((header::RETRY_AFTER, "5"))
+                    .body(format!(
+                        "concurrency limit: queued {:?} without a slot",
+                        cfg.queue_timeout
+                    )));
+            };
+            let waited = queued.elapsed();
+            if cfg.debug && waited > Duration::from_millis(1) {
+                eprintln!("~~ queued {waited:.2?} {path}");
+            }
+            Some(permit.expect("semaphore never closed"))
+        }
         None => None,
     };
 
@@ -411,7 +450,11 @@ async fn main() -> std::io::Result<()> {
     }
     if let Some(sem) = &cfg.limit {
         // 启动时一个 permit 都没发出去, available 就是配置值
-        println!("concurrency: {}", sem.available_permits());
+        println!(
+            "concurrency: {} (queue timeout {:?})",
+            sem.available_permits(),
+            cfg.queue_timeout
+        );
     }
 
     let (port, upstream) = (cfg.port, cfg.upstream.clone());
@@ -443,6 +486,7 @@ mod tests {
             debug: false,
             api_key: Some("test-key".to_string()),
             limit: None,
+            queue_timeout: Duration::from_secs(30),
             client: reqwest::Client::new(),
         }
     }
@@ -687,6 +731,37 @@ mod tests {
 
         // 4 个并发请求, 上游最多同时看到 2 个; 额度提前归还会看到 3~4, 意外串行会是 1
         assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
+    #[actix_web::test]
+    async fn queue_timeout_returns_service_unavailable() {
+        // 上游是死地址: 真打上去会 502, 拿到 503 才说明请求根本没出门
+        let mut cfg = test_cfg("http://127.0.0.1:0".to_string());
+        let sem = Arc::new(Semaphore::new(1));
+        cfg.limit = Some(sem.clone());
+        cfg.queue_timeout = Duration::from_millis(20);
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(cfg))
+                .service(web::resource("/{path:.*}").route(web::to(proxy))),
+        )
+        .await;
+
+        let held = sem.acquire().await.unwrap();
+        let request = probe_request("/v1/chat/completions").to_request();
+        let response = actix_web::test::call_service(&app, request).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "5"
+        );
+        drop(held);
     }
 
     #[test]

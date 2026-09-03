@@ -3,6 +3,7 @@
   "upstream": "https://xxx.example.ai",
   "api_key": "sk-...",
   "concurrency": 2,
+  "queue_timeout": 30,
   "patch": {
     "temperature": 0.7,
     "top_p": 0.9,

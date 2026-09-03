@@ -11,8 +11,8 @@ actix-web = { version = "4", default-features = false, features = ["macros", "ht
 reqwest = { version = "0.13", default-features = false, features = ["http2", "stream", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-# 只为 tokio::sync::Semaphore(并发限制); tokio 已在 actix-rt/reqwest 依赖树里, 不多编译一份
-tokio = { version = "1", features = ["sync"] }
+# 只为 Semaphore + timeout(并发限制); tokio 已在 actix-rt/reqwest 依赖树里, 不多编译一份
+tokio = { version = "1", features = ["sync", "time"] }
 
 [profile.release]
 # 发布二进制不带符号表(-2MB); 代价是 panic backtrace 无符号名
