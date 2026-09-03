@@ -44,6 +44,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - 上游连接失败时返回 502，body 为 `upstream error: <原因>`。
 - 单个请求体最大 16 MiB。
 - 上游连接超时 10s；不设整体超时，避免中断 SSE 长连接。
+- 配置 `concurrency` 后限制同时打到上游的请求数，超出的请求排队等待（不返回 429）；额度到响应体读完或客户端断开才归还，SSE 全程占用。
 - 上游启用 HTTP/2，多个流复用一条连接（按 ALPN 协商，上游不支持时回落 HTTP/1.1）。
 
 ## 手动下载
@@ -86,6 +87,7 @@ cargo run --release -- --debug
 | `port` | 否 | 监听端口，范围 `1..=65535`，默认 `8080`。 |
 | `upstream` | 是 | 上游 `http://` 或 `https://` 地址，不允许 query 或 fragment；末尾 `/` 会被去掉。 |
 | `api_key` | 否 | 客户端未发送 `Authorization` 时使用。 |
+| `concurrency` | 否 | 同时转发到上游的最大请求数，至少 `1`；不设则不限。超出的请求排队，不拒绝。 |
 | `patch` | 否 | 浅合并到请求体顶层的 JSON object；值为 `null` 时删除字段。 |
 | `rename` | 否 | 顶层字段重命名映射，所有目标值必须是字符串。 |
 
@@ -109,6 +111,7 @@ cargo run --release -- --debug
 PORT=8080 \
 UPSTREAM=https://api.example.com \
 API_KEY=sk-example \
+CONCURRENCY=2 \
 cargo run --release
 ```
 

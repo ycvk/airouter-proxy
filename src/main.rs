@@ -1,10 +1,14 @@
-use actix_web::body::BodyStream;
+use actix_web::body::{BodySize, BodyStream, MessageBody};
 use actix_web::http::{header, StatusCode};
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 // 上游可能按 UA 区分浏览器/客户端流量, 用真实 Chrome UA 而非 reqwest 默认
 const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
@@ -18,6 +22,8 @@ struct Cfg {
     patch: Vec<(String, Option<Box<RawValue>>)>,
     debug: bool,
     api_key: Option<String>,
+    /// 并发上限; None 表示不限。permit 随响应体一起 drop, 见 PermitBody
+    limit: Option<Arc<Semaphore>>,
     client: reqwest::Client,
 }
 
@@ -25,6 +31,7 @@ struct Cfg {
 struct FileCfg {
     port: Option<u16>,
     upstream: Option<String>,
+    concurrency: Option<u32>,
     #[serde(default)]
     patch: Value,
     #[serde(default)]
@@ -42,6 +49,7 @@ fn load_cfg() -> Result<Cfg, String> {
     let mut port = file_cfg.port.unwrap_or(8080);
     let mut upstream = file_cfg.upstream;
     let mut api_key = file_cfg.api_key;
+    let mut concurrency = file_cfg.concurrency;
 
     if let Some(value) = env_value("PORT")? {
         port = value
@@ -56,6 +64,15 @@ fn load_cfg() -> Result<Cfg, String> {
     }
     if let Some(value) = env_value("API_KEY")? {
         api_key = Some(value);
+    }
+    if let Some(value) = env_value("CONCURRENCY")? {
+        concurrency = Some(
+            value
+                .parse::<u32>()
+                .ok()
+                .filter(|&limit| limit > 0)
+                .ok_or_else(|| format!("invalid CONCURRENCY {value:?}: expected at least 1"))?,
+        );
     }
 
     let upstream = upstream.ok_or("missing upstream: set config.json upstream or UPSTREAM")?;
@@ -72,6 +89,7 @@ fn load_cfg() -> Result<Cfg, String> {
         patch: patch_pairs(&file_cfg.patch),
         debug: std::env::args().any(|a| a == "--debug"),
         api_key,
+        limit: concurrency.map(|limit| Arc::new(Semaphore::new(limit as usize))),
         client: reqwest::Client::builder()
             // 不设整体 timeout: 会误杀长 SSE 流; 只兜住连不上和空闲池连接
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -90,6 +108,9 @@ fn parse_file_cfg(s: &str) -> Result<FileCfg, String> {
         serde_json::from_str::<FileCfg>(s).map_err(|e| format!("invalid config.json: {e}"))?;
     if cfg.port == Some(0) {
         return Err("invalid config.json port: expected 1..=65535".to_string());
+    }
+    if cfg.concurrency == Some(0) {
+        return Err("invalid config.json concurrency: expected at least 1".to_string());
     }
     if cfg.upstream.as_deref().is_some_and(str::is_empty) {
         return Err("config.json upstream must not be empty".to_string());
@@ -212,6 +233,28 @@ fn is_connection_named<'a>(mut values: impl Iterator<Item = &'a str>, name: &str
     values.any(|value| connection_lists_header(value, name))
 }
 
+/// 把并发额度绑在响应体上: 响应流读完或客户端提前断开时一起 drop, 额度才归还。
+/// 只在 poll_next 上转发, 所以内层 body 必须 Unpin(BodyStream 对 Unpin 的流是 Unpin)。
+struct PermitBody<B> {
+    inner: B,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl<B: MessageBody + Unpin> MessageBody for PermitBody<B> {
+    type Error = B::Error;
+
+    fn size(&self) -> BodySize {
+        self.inner.size()
+    }
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<web::Bytes, Self::Error>>> {
+        Pin::new(&mut self.get_mut().inner).poll_next(cx)
+    }
+}
+
 async fn proxy(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, actix_web::Error> {
     let cfg = req
         .app_data::<web::Data<Cfg>>()
@@ -275,6 +318,17 @@ async fn proxy(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, actix
         BROWSER_UA.parse().expect("static UA"),
     );
 
+    // ponytail: 无界排队, 不设等待超时; 要拒绝而不是排队再加 429 分支
+    let permit = match &cfg.limit {
+        Some(sem) => Some(
+            sem.clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore never closed"),
+        ),
+        None => None,
+    };
+
     let url = format!("{}{}", cfg.upstream, path);
     let res = match cfg
         .client
@@ -321,7 +375,15 @@ async fn proxy(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, actix
         }
     }
     // 流式转发: SSE / chunked 响应按块透传, 不等整个 body
-    Ok(resp.body(BodyStream::new(res.bytes_stream())))
+    let body = BodyStream::new(res.bytes_stream());
+    Ok(match permit {
+        // 额度跟着 body 走: 上游还在吐流的请求一直占额度
+        Some(permit) => resp.body(PermitBody {
+            inner: body,
+            _permit: permit,
+        }),
+        None => resp.body(body),
+    })
 }
 
 #[actix_web::main]
@@ -346,6 +408,10 @@ async fn main() -> std::io::Result<()> {
             val.as_deref().map_or("<removed>", RawValue::get)
         );
     }
+    if let Some(sem) = &cfg.limit {
+        // 启动时一个 permit 都没发出去, available 就是配置值
+        println!("concurrency: {}", sem.available_permits());
+    }
 
     let (port, upstream) = (cfg.port, cfg.upstream.clone());
     // Data 只建一次, 各 worker clone 的是 Arc, 不再每 worker 深拷一份配置
@@ -365,6 +431,7 @@ async fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_cfg(upstream: String) -> Cfg {
         Cfg {
@@ -374,6 +441,7 @@ mod tests {
             patch: patch_pairs(&serde_json::json!({"reasoning_effort": "high"})),
             debug: false,
             api_key: Some("test-key".to_string()),
+            limit: None,
             client: reqwest::Client::new(),
         }
     }
@@ -396,38 +464,49 @@ mod tests {
             .set_payload(r#"{"model":"demo","max_tokens":128}"#)
     }
 
+    /// 读一个完整请求(头 + Content-Length 指定长度的 body)
+    fn read_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+        use std::io::Read;
+
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0; 4096];
+        let body_start = loop {
+            if let Some(offset) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                break offset + 4;
+            }
+            let read = stream.read(&mut buf).unwrap();
+            assert!(read > 0, "upstream request ended before its headers");
+            request.extend_from_slice(&buf[..read]);
+        };
+        let head = std::str::from_utf8(&request[..body_start])
+            .unwrap()
+            .to_owned();
+        let content_length = raw_header(&head, "content-length")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        while request.len() < body_start + content_length {
+            let read = stream.read(&mut buf).unwrap();
+            assert!(read > 0, "upstream request ended before its body");
+            request.extend_from_slice(&buf[..read]);
+        }
+        (
+            head,
+            request[body_start..body_start + content_length].to_vec(),
+        )
+    }
+
     fn spawn_asserting_upstream() -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let thread = std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
 
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut buf = [0; 4096];
-            let body_start = loop {
-                if let Some(offset) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break offset + 4;
-                }
-                let read = stream.read(&mut buf).unwrap();
-                assert!(read > 0, "upstream request ended before its headers");
-                request.extend_from_slice(&buf[..read]);
-            };
-            let head = std::str::from_utf8(&request[..body_start])
-                .unwrap()
-                .to_owned();
-            let content_length = raw_header(&head, "content-length")
-                .unwrap()
-                .parse::<usize>()
-                .unwrap();
-            while request.len() < body_start + content_length {
-                let read = stream.read(&mut buf).unwrap();
-                assert!(read > 0, "upstream request ended before its body");
-                request.extend_from_slice(&buf[..read]);
-            }
+            let (head, body) = read_request(&mut stream);
 
             assert!(head.starts_with("POST /v1/chat/completions?probe=1 HTTP/1.1\r\n"));
             assert_eq!(raw_header(&head, "authorization"), Some("Bearer test-key"));
@@ -436,8 +515,7 @@ mod tests {
             assert_eq!(raw_header(&head, "connection"), None);
             assert_eq!(raw_header(&head, "x-client-hop"), None);
             assert_eq!(raw_header(&head, "te"), None);
-            let body: Value =
-                serde_json::from_slice(&request[body_start..body_start + content_length]).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["model"], "demo");
             assert_eq!(body["max_completion_tokens"], 128);
             assert_eq!(body["reasoning_effort"], "high");
@@ -452,6 +530,45 @@ mod tests {
             stream.write_all(response_body).unwrap();
         });
         (format!("http://{addr}"), thread)
+    }
+
+    /// 一条连接处理一个请求, 返回上游侧同时在处理的请求数峰值。
+    fn spawn_counting_upstream(
+        requests: usize,
+    ) -> (String, Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peak = Arc::new(AtomicUsize::new(0));
+        let thread = std::thread::spawn({
+            let peak = peak.clone();
+            move || {
+                let inflight = Arc::new(AtomicUsize::new(0));
+                let workers: Vec<_> = (0..requests)
+                    .map(|_| {
+                        let (mut stream, _) = listener.accept().unwrap();
+                        let (inflight, peak) = (inflight.clone(), peak.clone());
+                        std::thread::spawn(move || {
+                            use std::io::Write;
+
+                            read_request(&mut stream);
+                            let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            // 攥住一会儿, 让真正并发的请求在上游侧重叠
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            // Connection: close 让 reqwest 不复用连接, 一条连接对应一个请求
+                            let response =
+                                b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok";
+                            stream.write_all(response).unwrap();
+                            inflight.fetch_sub(1, Ordering::SeqCst);
+                        })
+                    })
+                    .collect();
+                for worker in workers {
+                    worker.join().unwrap();
+                }
+            }
+        });
+        (format!("http://{addr}"), peak, thread)
     }
 
     #[test]
@@ -534,6 +651,41 @@ mod tests {
         assert!(std::str::from_utf8(&body)
             .unwrap()
             .starts_with("upstream error:"));
+    }
+
+    #[actix_web::test]
+    async fn concurrency_limit_caps_inflight_upstream_requests() {
+        let (upstream, peak, upstream_thread) = spawn_counting_upstream(4);
+        let mut cfg = test_cfg(upstream);
+        cfg.limit = Some(Arc::new(Semaphore::new(2)));
+        let app = std::rc::Rc::new(
+            actix_web::test::init_service(
+                App::new()
+                    .app_data(web::Data::new(cfg))
+                    .service(web::resource("/{path:.*}").route(web::to(proxy))),
+            )
+            .await,
+        );
+
+        let calls: Vec<_> = (0..4)
+            .map(|_| {
+                let app = app.clone();
+                actix_web::rt::spawn(async move {
+                    let request = probe_request("/v1/chat/completions?probe=1").to_request();
+                    let response = actix_web::test::call_service(&*app, request).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    // 必须把 body 读完, 额度才随响应体归还
+                    assert_eq!(actix_web::test::read_body(response).await, "ok");
+                })
+            })
+            .collect();
+        for call in calls {
+            call.await.unwrap();
+        }
+        upstream_thread.join().unwrap();
+
+        // 4 个并发请求, 上游最多同时看到 2 个; 额度提前归还会看到 3~4, 意外串行会是 1
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
     }
 
     #[test]
