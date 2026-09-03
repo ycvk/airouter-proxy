@@ -77,7 +77,11 @@ fn load_cfg() -> Result<Cfg, String> {
             .connect_timeout(std::time::Duration::from_secs(10))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .build()
-            .map_err(|e| format!("cannot build http client: {e}"))?,
+            // reqwest 的 Display 只有 "builder error"; Debug 带上 source 链, 最常见的原因是
+            // 系统根证书缺失(最小化容器/镜像), rustls 拿不到 TLS root store。
+            .map_err(|e| {
+                format!("cannot build http client: {e:?}; missing system CA certificates? install ca-certificates")
+            })?,
     })
 }
 
@@ -322,7 +326,14 @@ async fn proxy(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, actix
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let cfg = load_cfg().map_err(std::io::Error::other)?;
+    // 直接打印, 不套 io::Error::other 的 Custom { kind: Other, error: ".." } 包装
+    let cfg = match load_cfg() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
     if cfg.debug {
         eprintln!("debug: on (request logs on stderr)");
     }
