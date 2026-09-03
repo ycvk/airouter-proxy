@@ -233,7 +233,8 @@ fn is_connection_named<'a>(mut values: impl Iterator<Item = &'a str>, name: &str
     values.any(|value| connection_lists_header(value, name))
 }
 
-/// 把并发额度绑在响应体上: 响应流读完或客户端提前断开时一起 drop, 额度才归还。
+/// 把并发额度绑在响应体上: 响应体 drop 时才归还, 所以上游还在吐流的请求一直占额度。
+/// 客户端中途断开只有在 actix 下一次写响应失败时才被发现(静默的流会占到上游自己结束)。
 /// 只在 poll_next 上转发, 所以内层 body 必须 Unpin(BodyStream 对 Unpin 的流是 Unpin)。
 struct PermitBody<B> {
     inner: B,
