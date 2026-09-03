@@ -466,6 +466,9 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::PayloadConfig::new(16 << 20)) // ponytail: 长对话 JSON 常超默认 256KB; 16MB 足够, 再大按需调
             .service(web::resource("/{path:.*}").route(web::to(proxy)))
     })
+    // 客户端 FIN 即中止请求: 默认允许半关闭, 排队中/流式的请求会在客户端走后继续跑,
+    // 白占并发额度还白烧上游 token。代价是真半关闭(发完请求就 shutdown 写半边)的客户端不再支持。
+    .h1_allow_half_closed(false)
     .bind(("0.0.0.0", port))?; // 0.0.0.0: 供 OrbStack 容器内 pentagi 经 orb.local (VM 网关) 访问
 
     println!("listening on http://127.0.0.1:{port}  ->  {upstream}");
