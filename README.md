@@ -40,6 +40,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - 只解析请求体顶层字段，嵌套内容按原始字节透传（不重排 key、不规范化数字）。
 - 客户端未提供 `Authorization` 时，使用配置的 API key。
 - `User-Agent` 统一改写为桌面 Chrome，客户端原值不透传。
+- 上游请求固定 `Accept-Encoding: identity`，客户端的压缩偏好不透传：上游一旦 gzip，SSE 会被压缩器攒成一整块、等流结束才返回。代价是上游链路多传字节。
 - 过滤逐跳 HTTP headers（含 `Connection` 动态列出的头），流式转发 SSE/chunked 响应。
 - 上游连接失败时返回 502，body 为 `upstream error: <原因>`。
 - 单个请求体最大 16 MiB。

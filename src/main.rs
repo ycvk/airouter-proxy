@@ -224,8 +224,9 @@ fn rewrite_body<'a>(
 }
 
 // reqwest 按改写后的 body 和上游 URL 重建 content-length/host。
+// accept-encoding 由本代理定, 客户端的值不透传(下面强制 identity)。
 fn is_request_skipped(name: &str) -> bool {
-    is_hop_by_hop(name) || matches!(name, "content-length" | "host")
+    is_hop_by_hop(name) || matches!(name, "content-length" | "host" | "accept-encoding")
 }
 
 // RFC 9110 §7.6.1 固定逐跳头; Connection 还可动态指定其他逐跳头。
@@ -254,7 +255,6 @@ fn is_connection_named<'a>(mut values: impl Iterator<Item = &'a str>, name: &str
 }
 
 /// 把并发额度绑在响应体上: 响应体 drop 时才归还, 所以上游还在吐流的请求一直占额度。
-/// 客户端中途断开只有在 actix 下一次写响应失败时才被发现(静默的流会占到上游自己结束)。
 /// 只在 poll_next 上转发, 所以内层 body 必须 Unpin(BodyStream 对 Unpin 的流是 Unpin)。
 struct PermitBody<B> {
     inner: B,
@@ -337,6 +337,13 @@ async fn proxy(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, actix
     headers.insert(
         reqwest::header::USER_AGENT,
         BROWSER_UA.parse().expect("static UA"),
+    );
+    // 本代理不解压, 压缩响应原样透传。上游一旦 gzip, SSE 就可能被压缩器攒成一整块,
+    // 到流结束才吐出来(客户端的 gzip 解码器同理), 所以显式要 identity 换实时性。
+    // 代价是上游链路多传字节; 想省带宽得开 reqwest 的 gzip feature 自己解压。
+    headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("identity"),
     );
 
     let permit = match &cfg.limit {
@@ -508,6 +515,7 @@ mod tests {
             .insert_header((header::CONNECTION, "x-client-hop"))
             .insert_header(("x-client-hop", "secret"))
             .insert_header((header::TE, "trailers"))
+            .insert_header((header::ACCEPT_ENCODING, "gzip, deflate"))
             .insert_header(("x-request-id", "request-42"))
             .set_payload(r#"{"model":"demo","max_tokens":128}"#)
     }
@@ -559,6 +567,8 @@ mod tests {
             assert!(head.starts_with("POST /v1/chat/completions?probe=1 HTTP/1.1\r\n"));
             assert_eq!(raw_header(&head, "authorization"), Some("Bearer test-key"));
             assert_eq!(raw_header(&head, "user-agent"), Some(BROWSER_UA));
+            // 客户端要 gzip 也不透传: 压缩会把 SSE 攒成一块, 上游只许 identity
+            assert_eq!(raw_header(&head, "accept-encoding"), Some("identity"));
             assert_eq!(raw_header(&head, "x-request-id"), Some("request-42"));
             assert_eq!(raw_header(&head, "connection"), None);
             assert_eq!(raw_header(&head, "x-client-hop"), None);
